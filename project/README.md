@@ -1,4 +1,4 @@
- Open PowerShell in the copied project folder and run:
+ Open PowerShell in the  project folder and run:
 
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
