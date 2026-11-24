@@ -5,6 +5,16 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import os
 from datetime import timedelta
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended.exceptions import JWTExtendedException
+from jwt.exceptions import PyJWTError
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+class AuthAwareApi(Api):
+    def error_router(self, original_handler, error):
+        if isinstance(error, (JWTExtendedException, PyJWTError)):
+            return original_handler(error)
+        return super().error_router(original_handler, error)
 
 app = Flask(__name__)
 app.config["JWT_SECRET_KEY"] = os.environ["JWT_SECRET_KEY"]
@@ -12,16 +22,53 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=15)
 jwt = JWTManager(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
 db = SQLAlchemy(app)
-api = Api(app)
+api = AuthAwareApi(app)
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],            
+    storage_uri="memory://",      
+    headers_enabled=True,
+)
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return {"message": f"Rate limit exceeded: {e.description}"}, 429
 
 class UserModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), nullable=False, default='user')
 
     def __repr__(self):
         return f"User(name = {self.username}, email = {self.email})"
+
+def get_current_user():
+    identity = get_jwt_identity()
+
+    try:
+        user_id = int(identity)
+    except (TypeError, ValueError):
+        abort(401, message="Invalid user identity")
+
+    user = db.session.get(UserModel, user_id)
+    if user is None:
+        abort(401, message="User no longer exists")
+
+    return user
+
+
+def require_admin(user):
+    if user.role != "admin":
+        abort(403, message="Admin access required")
+
+
+def require_owner_or_admin(user, user_id):
+    if user.id != user_id and user.role != "admin":
+        abort(403, message="You cannot access this user")
 
 login_args = reqparse.RequestParser()
 login_args.add_argument("username", type=str, required=True)
@@ -79,11 +126,14 @@ def validate_user_fields(args):
     return username, email
 
 class User(Resource):
+    @jwt_required()
     @marshal_with(users_fields)
     def get(self):
-        users = UserModel.query.all()
-        return  users
+        current_user = get_current_user()
+        require_admin(current_user)
+        return UserModel.query.all()
 
+    @limiter.limit("10/hour")
     @marshal_with(users_fields)
     def post(self):
         args = create_user_args.parse_args()
@@ -103,16 +153,25 @@ class User(Resource):
         db.session.commit()
         return user, 201
 
+
 class UserDetail(Resource):
+    @jwt_required()
     @marshal_with(users_fields)
     def get(self, user_id):
+        current_user = get_current_user()
+        require_owner_or_admin(current_user, user_id)
+
         user = db.session.get(UserModel, user_id)
         if user is None:
             abort(404, message="User not found")
         return user
 
+    @jwt_required()
     @marshal_with(users_fields)
     def put(self, user_id):
+        current_user = get_current_user()
+        require_owner_or_admin(current_user, user_id)
+
         user = db.session.get(UserModel, user_id)
         if user is None:
             abort(404, message="User not found")
@@ -125,15 +184,22 @@ class UserDetail(Resource):
         db.session.commit()
         return user
 
+    @jwt_required()
     def delete(self, user_id):
+        current_user = get_current_user()
+        require_admin(current_user)
+
         user = db.session.get(UserModel, user_id)
         if user is None:
             abort(404, message="User not found")
+
         db.session.delete(user)
         db.session.commit()
-        return '', 204
+        return "", 204
 
 class Login(Resource):
+    decorators = [limiter.limit("5/minute")]
+
     def post(self):
         args = login_args.parse_args()
         user = UserModel.query.filter_by(username=args['username']).first()
@@ -141,7 +207,7 @@ class Login(Resource):
         if user is None or not check_password_hash(user.password_hash, args['password']):
             return {"message": "Invalid username or password"}, 401
 
-        token = create_access_token(identity=user.id)
+        token = create_access_token(identity=str(user.id))
         return {"access_token": token}, 200
 
 api.add_resource(User, "/api/users/")
@@ -168,5 +234,9 @@ def current_user():
 
 if __name__ == '__main__':
     with app.app_context():
+        print("Database path:", db.engine.url.database)
         db.create_all()
     app.run(debug=True)
+
+
+
